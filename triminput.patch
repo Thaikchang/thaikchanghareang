@@ -1,0 +1,133 @@
+diff --git a/Include/internal/pycore_sysmodule.h b/Include/internal/pycore_sysmodule.h
+index d86599c..5d4ba96 100644
+--- a/Include/internal/pycore_sysmodule.h
++++ b/Include/internal/pycore_sysmodule.h
+@@ -18,6 +18,7 @@ extern int _PySys_ClearAttrString(PyInterpreterState *interp,
+ 
+ extern int _PySys_SetFlagObj(Py_ssize_t pos, PyObject *new_value);
+ extern int _PySys_SetIntMaxStrDigits(int maxdigits);
++extern int _PySys_GetAutoTrimInput(void);
+ 
+ extern int _PySysRemoteDebug_SendExec(int pid, int tid, const char *debugger_script_path);
+ 
+diff --git a/Python/bltinmodule.c b/Python/bltinmodule.c
+index 72f2e35..0c25c8d 100644
+--- a/Python/bltinmodule.c
++++ b/Python/bltinmodule.c
+@@ -17,10 +17,28 @@
+ #include "pycore_pyerrors.h"      // _PyErr_NoMemory()
+ #include "pycore_pystate.h"       // _PyThreadState_GET()
+ #include "pycore_pythonrun.h"     // _Py_SourceAsString()
++#include "pycore_sysmodule.h"     // _PySys_GetAutoTrimInput()
+ #include "pycore_tuple.h"         // _PyTuple_Recycle()
+ 
+ #include "clinic/bltinmodule.c.h"
+ 
++static PyObject *
++builtin_input_trim(PyObject *result)
++{
++    if (!_PySys_GetAutoTrimInput() || !PyUnicode_Check(result)) {
++        return Py_NewRef(result);
++    }
++
++    PyObject *strip = PyObject_GetAttr((PyObject *)&PyUnicode_Type,
++                                       &_Py_ID(strip));
++    if (strip == NULL) {
++        return NULL;
++    }
++    PyObject *trimmed = PyObject_CallOneArg(strip, result);
++    Py_DECREF(strip);
++    return trimmed;
++}
++
+ #ifdef HAVE_UNISTD_H
+ #  include <unistd.h>             // isatty()
+ #endif
+@@ -2520,8 +2538,14 @@ builtin_input_impl(PyObject *module, PyObject *prompt)
+         Py_XDECREF(po);
+         PyMem_Free(s);
+ 
++        if (result != NULL) {
++            PyObject *trimmed = builtin_input_trim(result);
++            Py_DECREF(result);
++            result = trimmed;
++        }
+         if (result != NULL) {
+             if (PySys_Audit("builtins.input/result", "O", result) < 0) {
++                Py_DECREF(result);
+                 goto error;
+             }
+         }
+@@ -2552,6 +2576,11 @@ builtin_input_impl(PyObject *module, PyObject *prompt)
+         PyErr_Clear();
+     }
+     tmp = PyFile_GetLine(fin, -1);
++    if (tmp != NULL) {
++        PyObject *trimmed = builtin_input_trim(tmp);
++        Py_DECREF(tmp);
++        tmp = trimmed;
++    }
+     Py_DECREF(fin);
+     Py_DECREF(fout);
+     Py_DECREF(ferr);
+diff --git a/Python/sysmodule.c b/Python/sysmodule.c
+index f8c72b0..91f3150 100644
+--- a/Python/sysmodule.c
++++ b/Python/sysmodule.c
+@@ -72,6 +72,8 @@ extern const char *PyWin_DLLVersionString;
+ #  include <fcntl.h>
+ #endif
+ 
++static int pvm_auto_trim_input = 0;
++
+ /*[clinic input]
+ module sys
+ [clinic start generated code]*/
+@@ -2888,6 +2890,29 @@ sys_get_lazy_imports_impl(PyObject *module)
+     }
+ }
+ 
++static PyObject *
++sys_set_auto_trim_input(PyObject *Py_UNUSED(module), PyObject *enabled)
++{
++    int value = PyObject_IsTrue(enabled);
++    if (value < 0) {
++        return NULL;
++    }
++    _Py_atomic_store_int_relaxed(&pvm_auto_trim_input, value);
++    Py_RETURN_NONE;
++}
++
++static PyObject *
++sys_get_auto_trim_input(PyObject *Py_UNUSED(module), PyObject *Py_UNUSED(ignored))
++{
++    return PyBool_FromLong(_Py_atomic_load_int_relaxed(&pvm_auto_trim_input));
++}
++
++int
++_PySys_GetAutoTrimInput(void)
++{
++    return _Py_atomic_load_int_relaxed(&pvm_auto_trim_input);
++}
++
+ static PyMethodDef sys_methods[] = {
+     /* Might as well keep this in alphabetic order */
+     SYS_ADDAUDITHOOK_METHODDEF
+@@ -2903,6 +2928,8 @@ static PyMethodDef sys_methods[] = {
+     SYS_EXC_INFO_METHODDEF
+     SYS_EXCEPTHOOK_METHODDEF
+     SYS_EXIT_METHODDEF
++    {"get_auto_trim_input", sys_get_auto_trim_input, METH_NOARGS,
++     "Return whether input() trims surrounding whitespace."},
+     SYS_GETDEFAULTENCODING_METHODDEF
+     SYS_GETDLOPENFLAGS_METHODDEF
+     SYS_GETALLOCATEDBLOCKS_METHODDEF
+@@ -2924,6 +2951,8 @@ static PyMethodDef sys_methods[] = {
+     SYS__IS_INTERNED_METHODDEF
+     SYS_IS_FINALIZING_METHODDEF
+     SYS_MDEBUG_METHODDEF
++    {"set_auto_trim_input", sys_set_auto_trim_input, METH_O,
++     "Enable or disable trimming surrounding whitespace from input()."},
+     SYS_SETSWITCHINTERVAL_METHODDEF
+     SYS_GETSWITCHINTERVAL_METHODDEF
+     SYS_SETDLOPENFLAGS_METHODDEF
